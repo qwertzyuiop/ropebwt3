@@ -262,7 +262,7 @@ static void write_per_seq(step_t *t)
 				int32_t st = q->info>>32, en = (int32_t)q->info;
 				out.l = 0;
 				write_name(&out, s);
-				rb3_sprintf_lite(&out, "\t%d\t%d\t%ld", st, en, (long)q->size);
+				rb3_sprintf_lite(&out, "\t%d\t%d\t%ld\t%ld\t%ld", st, en, q->x[0], q->x[1], (long)q->size);
 				if (r->n_pos > 0) {
 					int32_t j;
 					rb3_sprintf_lite(&out, "\t%ld", r->n_pos);
