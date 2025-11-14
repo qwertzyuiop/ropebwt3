@@ -12,13 +12,14 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV } rb3_sea
 #define RB3_MF_WRITE_UNMAP 0x2
 #define RB3_MF_WRITE_COV   0x4
 #define RB3_MF_WRITE_ALL   0x8
+#define RB3_MF_BOTH_DIR    0x10
 
 typedef struct {
 	uint32_t flag;
 	int32_t n_threads, min_gap_len, hapdiv_k, hapdiv_w;
 	int32_t max_pos;
 	rb3_search_algo_t algo;
-	int64_t min_occ, min_len;
+	int64_t min_occ, min_len, max_all_out;
 	int64_t batch_size;
 	rb3_swopt_t swo;
 } rb3_mopt_t;
@@ -74,7 +75,7 @@ typedef struct {
 	const pipeline_t *p;
 	int32_t n_seq, n_hapdiv;
 	m_seq_t *seq;
-	rb3_swrst_t *rst;
+	rb3_swrst_t *rst, *rst_rev;
 	m_hapdiv_t *hapdiv;
 	m_tbuf_t *buf;
 } step_t;
@@ -90,6 +91,11 @@ static void worker_for_seq(void *data, long i, int tid)
 	rb3_char2nt6(s->len, s->seq);
 	if (p->opt->algo == RB3_SA_SW) { // BWA-SW
 		rb3_sw(b->km, &p->opt->swo, &p->fmi, s->len, s->seq, &t->rst[i]);
+		if (t->rst_rev) {
+			rb3_revcomp6(s->len, s->seq);
+			rb3_sw(b->km, &p->opt->swo, &p->fmi, s->len, s->seq, &t->rst_rev[i]);
+			rb3_revcomp6(s->len, s->seq);
+		}
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
@@ -157,21 +163,28 @@ static inline void write_name(kstring_t *out, const m_seq_t *s)
 	else rb3_sprintf_lite(out, "seq%ld", s->id + 1);
 }
 
+static void pos_stranded(const rb3_sid_t *sid, const rb3_pos_t *pos, int32_t rlen, int64_t *clen, int64_t *st, int64_t *en)
+{
+	*clen = sid->len[pos->sid>>1];
+	if ((pos->sid & 1) == 0)
+		*st = pos->pos, *en = pos->pos + rlen;
+	else
+		*st = *clen - (pos->pos + rlen), *en = *clen - pos->pos;
+}
+
 static void write_paf(kstring_t *out, const rb3_fmi_t *f, const rb3_swhit_t *h, const m_seq_t *s)
 {
 	int32_t k;
 	write_name(out, s);
 	rb3_sprintf_lite(out, "\t%d\t%d\t%d", s->len, h->qoff[0], h->qoff[0] + h->qlen);
-	if (h->pos >= 0 && h->sid >= 0) {
-		if (f->sid) { // sequence names and lengths are available
-			int64_t rlen = f->sid->len[h->sid>>1];
-			rb3_sprintf_lite(out, "\t%c\t%s\t%ld", "+-"[h->sid&1], f->sid->name[h->sid>>1], (long)rlen);
-			if ((h->sid&1) == 0) // forward strand
-				rb3_sprintf_lite(out, "\t%ld\t%ld", h->pos, h->pos + h->rlen);
-			else // reverse strand
-				rb3_sprintf_lite(out, "\t%ld\t%ld", rlen - (h->pos + h->rlen), rlen - h->pos);
-		} else { // sequence names and lengths are not available
-			rb3_sprintf_lite(out, "\t+\t%ld\t*\t%ld\t%ld", h->sid, h->pos, h->pos + h->rlen); // always on the forward strand
+	if (h->n_pos > 0) {
+		int64_t sid = h->pos[0].sid, pos = h->pos[0].pos;
+		if (f->sid) { // print with sequence names and lengths
+			int64_t clen, st, en;
+			pos_stranded(f->sid, &h->pos[0], h->rlen, &clen, &st, &en);
+			rb3_sprintf_lite(out, "\t%c\t%s\t%ld\t%ld\t%ld", "+-"[sid&1], f->sid->name[sid>>1], (long)clen, st, en);
+		} else {
+			rb3_sprintf_lite(out, "\t+\t%ld\t*\t%ld\t%ld", sid, pos, pos + h->rlen); // always on the forward strand
 		}
 	} else {
 		rb3_sprintf_lite(out, "\t*\t*\t%d\t*\t*", h->rlen);
@@ -186,21 +199,42 @@ static void write_paf(kstring_t *out, const rb3_fmi_t *f, const rb3_swhit_t *h, 
 		for (k = 0; k < h->rlen; ++k)
 			rb3_sprintf_lite(out, "%c", "$ACGTN"[h->rseq[k]]);
 	}
+	if (h->n_pos > 1) {
+		rb3_sprintf_lite(out, "\ta%c:Z:", f->sid? 'p' : 'q');
+		for (k = 1; k < h->n_pos; ++k) {
+			int64_t sid = h->pos[k].sid, pos = h->pos[k].pos;
+			if (f->sid) {
+				int64_t clen, st, en;
+				pos_stranded(f->sid, &h->pos[k], h->rlen, &clen, &st, &en);
+				rb3_sprintf_lite(out, "%s,%c,%ld;", f->sid->name[sid>>1], "+-"[sid&1], st);
+			} else {
+				rb3_sprintf_lite(out, "%ld,%ld;", sid, pos);
+			}
+		}
+	}
 	rb3_sprintf_lite(out, "\n");
 }
 
-static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *r)
+static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *r, char strand, int64_t max_all_out)
 {
+	int64_t n_out = 0, tot = 0;
 	int32_t i;
+	if (max_all_out <= 0) max_all_out = INT64_MAX;
+	for (i = 0; i < r->n; ++i) tot += r->a[i].hi - r->a[i].lo;
+	for (i = 0; i < r->n; ++i) {
+		n_out += r->a[i].hi - r->a[i].lo;
+		if (n_out >= max_all_out) break;
+	}
 	rb3_sprintf_lite(out, "QS\t");
 	write_name(out, s);
-	rb3_sprintf_lite(out, "\t%d\t%d\n", s->len, r->n);
-	for (i = 0; i < r->n; ++i) {
+	rb3_sprintf_lite(out, "\t%d\t%d\t%c\t%ld\t%ld\n", s->len, r->n, strand, n_out, tot);
+	for (i = 0, n_out = 0; i < r->n; ++i) {
 		const rb3_swhit_t *h = &r->a[i];
 		rb3_sprintf_lite(out, "QH\t%ld\t%d\t%d\t%s\n", (long)(h->hi - h->lo), h->score, h->blen - h->mlen, h->cs);
+		n_out += h->hi - h->lo;
+		if (n_out >= max_all_out) break;
 	}
 	rb3_sprintf_lite(out, "//\n");
-	fputs(out->s, stdout);
 }
 
 static void write_per_seq(step_t *t)
@@ -213,8 +247,13 @@ static void write_per_seq(step_t *t)
 		free(s->seq);
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
-			write_all_hits(&out, s, &t->rst[j]);
+			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
+			if (t->rst_rev) {
+				write_all_hits(&out, s, &t->rst_rev[j], '-', p->opt->max_all_out);
+				rb3_swrst_free(&t->rst_rev[j]);
+			}
+			fputs(out.s, stdout);
 		} else if (p->opt->algo == RB3_SA_SW) { // write PAF
 			rb3_swrst_t *r = &t->rst[j];
 			if (r->n > 0) { // mapped
@@ -282,6 +321,7 @@ static void write_per_seq(step_t *t)
 	}
 	free(out.s);
 	free(t->rst);
+	free(t->rst_rev);
 }
 
 static void write_hapdiv(step_t *t)
@@ -353,6 +393,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 				assert(n_hapdiv == t->n_hapdiv);
 			} else { // per-sequence mode (sw, mem, gap and coverage)
 				t->rst = RB3_CALLOC(rb3_swrst_t, n_seq);
+				if (p->opt->flag & RB3_MF_BOTH_DIR)
+					t->rst_rev = RB3_CALLOC(rb3_swrst_t, n_seq);
 			}
 			t->buf = RB3_CALLOC(m_tbuf_t, p->opt->n_threads);
 			for (i = 0; i < p->opt->n_threads; ++i)
@@ -407,16 +449,17 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 
 	rb3_mopt_init(&opt);
 	p.opt = &opt, p.id = 0;
-	while ((c = ketopt(&o, argc, argv, 1, "Ll:c:t:K:MdN:A:B:O:E:C:m:k:uj:ey:a:w:p:", long_options)) >= 0) {
+	while ((c = ketopt(&o, argc, argv, 1, "Ll:c:t:K:MdN:A:B:O:E:C:m:k:uj:ey:a:w:p:bg:", long_options)) >= 0) {
 		if (c == 'L') is_line = 1;
 		else if (c == 'a') opt.algo = RB3_SA_HAPDIV, opt.hapdiv_k = atoi(o.arg);
 		else if (c == 'w') opt.algo = RB3_SA_HAPDIV, opt.hapdiv_w = atoi(o.arg);
 		else if (c == 'd') opt.algo = RB3_SA_SW, load_flag |= RB3_LOAD_ALL;
 		else if (c == 'l') opt.min_len = atol(o.arg);
 		else if (c == 'c') opt.min_occ = atol(o.arg);
+		else if (c == 'g') opt.max_all_out = atol(o.arg), opt.flag |= RB3_MF_WRITE_ALL, opt.swo.flag |= RB3_SWF_E2E, opt.swo.end_len = 1, no_ssa = 1;
 		else if (c == 't') opt.n_threads = atoi(o.arg);
 		else if (c == 'K') opt.batch_size = rb3_parse_num(o.arg);
-		else if (c == 'p') opt.max_pos = atoi(o.arg);
+		else if (c == 'p') opt.max_pos = opt.swo.max_pos = atoi(o.arg);
 		else if (c == 'N') opt.swo.n_best = atoi(o.arg);
 		else if (c == 'M') load_flag |= RB3_LOAD_MMAP;
 		else if (c == 'A') opt.swo.match = atoi(o.arg);
@@ -430,6 +473,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 'e') opt.swo.flag |= RB3_SWF_E2E, opt.swo.end_len = 1;
 		else if (c == 'y') opt.swo.e2e_drop = atoi(o.arg);
 		else if (c == 'u') opt.flag |= RB3_MF_WRITE_UNMAP;
+		else if (c == 'b') opt.flag |= RB3_MF_BOTH_DIR;
 		else if (c == 301) no_ssa = 1;
 		else if (c == 302) opt.swo.flag |= RB3_SWF_KEEP_RS;
 		else if (c == 303) opt.min_gap_len = rb3_parse_num(o.arg);
@@ -466,7 +510,6 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		if (strcmp(argv[0], "mem") == 0 || strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -l INT      min MEM length [%ld]\n", (long)opt.min_len);
 			fprintf(stderr, "  -c INT      min interval size [%ld]\n", (long)opt.min_occ);
-			fprintf(stderr, "  -p INT      output up to INT positions [%d]\n", opt.max_pos);
 			fprintf(stderr, "  --old-mem   use the original MEM algorithm (for testing)\n");
 			fprintf(stderr, "  --gap=NUM   output regions >=NUM that are not covered by MEMs [%d]\n", opt.min_gap_len);
 			fprintf(stderr, "  --cov       output breadth of coverage\n");
@@ -492,12 +535,15 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  -e          end-to-end mode (forcing -k to 1)\n");
 			fprintf(stderr, "  -j INT      min MEM length to initiate alignment [%d]\n", opt.swo.min_mem_len);
 			fprintf(stderr, "  -k INT      require INT-mer match at the end of alignment [%d]\n", opt.swo.end_len);
+			fprintf(stderr, "  -b          align both strands (effective with --all-e2e)\n");
 			fprintf(stderr, "  -u          write unmapped queries to PAF\n");
 			fprintf(stderr, "  --seq       write reference sequence to the rs tag\n");
 			fprintf(stderr, "  --all-e2e   write all end-to-end hits in a compact format (forcing -e)\n");
+			fprintf(stderr, "  -g INT      cap the number of --all-e2e output to INT (forcing --all-e2e)\n");
 			fprintf(stderr, "  --no-ssa    ignore the sampled suffix array\n");
 		}
 		fprintf(stderr, "  -t INT      number of threads [%d]\n", opt.n_threads);
+		fprintf(stderr, "  -p INT      output up to INT positions [%d]\n", opt.max_pos);
 		fprintf(stderr, "  -L          one sequence per line in the input\n");
 		fprintf(stderr, "  -K NUM      query batch size [100m]\n");
 		fprintf(stderr, "  -M          use mmap to load FMD\n");
@@ -518,7 +564,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
-		puts("CC\tQH  refCount   score     editDist   cs");
+		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
 		puts("CC");
 	}
 	for (j = o.ind + 1; j < argc; ++j) {
